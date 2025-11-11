@@ -146,6 +146,12 @@ class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
     @model_validator(mode="after")
     def validate_opposite_positions(self):
         if self.hyperliquid_position == self.binance_position:
+            fields_set = getattr(self, "model_fields_set", set())
+            hyper_set = "hyperliquid_position" in fields_set
+            binance_set = "binance_position" in fields_set
+            if not (hyper_set and binance_set):
+                # Defer validation until both prompts have been answered explicitly.
+                return self
             raise ValueError("Hyperliquid and Binance positions must be opposite.")
         return self
 
@@ -200,7 +206,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         self._stage: str = "not_started"
         self._closing_recovery: bool = False
 
-        # Short leg (Hyperliquid)
+        # Short leg state (connector assigned dynamically based on config)
         self._short_order_id: Optional[str] = None
         self._short_open_order_price: Optional[Decimal] = None
         self._short_fill_event: asyncio.Event = asyncio.Event()
@@ -213,7 +219,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         self._short_close_fill_event: asyncio.Event = asyncio.Event()
         self._short_close_filled_amount: Optional[Decimal] = None
 
-        # Long leg (Binance)
+        # Long leg state
         self._long_order_id: Optional[str] = None
         self._long_open_order_price: Optional[Decimal] = None
         self._long_fill_event: asyncio.Event = asyncio.Event()
@@ -562,6 +568,13 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 return "_long_close_order_id", "_long_close_order_price", self._long_close_fill_event
         raise ValueError(f"Unknown leg {leg}")
 
+    def _connector_details_for_leg(self, leg: str) -> tuple[str, str]:
+        if leg == "short":
+            return self.short_connector_name, self.short_trading_pair
+        if leg == "long":
+            return self.long_connector_name, self.long_trading_pair
+        raise ValueError(f"Unknown leg {leg}")
+
     def _place_limit_order(
         self,
         connector_name: str,
@@ -613,13 +626,15 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
 
     async def _cancel_active_orders(self):
         tasks = []
-        for connector_name, trading_pair, order_id in [
-            (self.hyperliquid_connector_name, self.hyperliquid_trading_pair, self._short_order_id),
-            (self.binance_connector_name, self.binance_trading_pair, self._long_order_id),
-            (self.hyperliquid_connector_name, self.hyperliquid_trading_pair, self._short_close_order_id),
-            (self.binance_connector_name, self.binance_trading_pair, self._long_close_order_id),
-        ]:
+        cancel_targets = [
+            ("short", self._short_order_id),
+            ("long", self._long_order_id),
+            ("short", self._short_close_order_id),
+            ("long", self._long_close_order_id),
+        ]
+        for leg, order_id in cancel_targets:
             if order_id:
+                connector_name, trading_pair = self._connector_details_for_leg(leg)
                 tasks.append(self._cancel_order(connector_name, trading_pair, order_id))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
