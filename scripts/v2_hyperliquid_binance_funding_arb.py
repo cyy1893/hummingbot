@@ -1,7 +1,10 @@
 import asyncio
+import json
 import os
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Dict, List, Literal, Optional, Set
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from pydantic import Field, field_validator, model_validator
 
@@ -22,7 +25,16 @@ from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 
 FUNDING_WINDOW_SECONDS = 60
-HYPER_TO_BINANCE_HOUR_MULTIPLIER = Decimal("8")
+SECONDS_PER_HOUR = 3600
+DEFAULT_FUNDING_INTERVAL_HOURS = Decimal("1")
+CONNECTOR_FUNDING_INTERVAL_HOURS: Dict[str, Decimal] = {
+    "hyperliquid_perpetual": Decimal("1"),
+    "hyperliquid_perpetual_testnet": Decimal("1"),
+    "binance_perpetual": Decimal("8"),
+    "binance_perpetual_testnet": Decimal("8"),
+}
+BINANCE_INTERVAL_REFRESH_SECONDS = 1800
+BINANCE_ALLOWED_INTERVALS_HOURS = {Decimal("1"), Decimal("2"), Decimal("4"), Decimal("8")}
 
 
 class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
@@ -231,6 +243,9 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         # Order ownership map for event handling
         self._order_owner: Dict[str, tuple[str, str]] = {}
         self._strategy_cancelled_orders: Set[str] = set()
+        self._connector_interval_overrides: Dict[str, Decimal] = {}
+        self._binance_interval_last_refresh: float = 0.0
+        self._binance_last_next_funding_ts: Optional[int] = None
 
     def apply_initial_setting(self):
         for connector_name, trading_pair in [
@@ -620,13 +635,126 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         signed_rate = rate if open_side == TradeType.SELL else -rate
         return signed_rate * multiplier
 
+    def _seconds_to_next_hour(self, timestamp: float) -> int:
+        seconds_into_hour = int(timestamp) % SECONDS_PER_HOUR
+        seconds_remaining = SECONDS_PER_HOUR - seconds_into_hour
+        return seconds_remaining
+
+    def _settlement_hours_for_connector(self, connector_name: str) -> Decimal:
+        connector_key = connector_name.lower()
+        override = self._connector_interval_overrides.get(connector_key)
+        if override is not None and override > Decimal("0"):
+            return override
+        for name, hours in CONNECTOR_FUNDING_INTERVAL_HOURS.items():
+            if name in connector_key:
+                return hours
+        return DEFAULT_FUNDING_INTERVAL_HOURS
+
+    def _hourly_rate_for_connector(self, rate: Optional[Decimal], connector_name: str) -> Optional[Decimal]:
+        if rate is None:
+            return None
+        settlement_hours = self._settlement_hours_for_connector(connector_name)
+        if settlement_hours <= Decimal("0"):
+            return rate
+        return rate / settlement_hours
+
+    def _normalize_binance_interval(self, hours: Decimal) -> Decimal:
+        if not BINANCE_ALLOWED_INTERVALS_HOURS:
+            return hours
+        closest = min(BINANCE_ALLOWED_INTERVALS_HOURS, key=lambda candidate: abs(candidate - hours))
+        return closest
+
+    def _set_connector_interval_override(self, connector_name: str, hours: Decimal):
+        if hours is None or hours <= Decimal("0"):
+            return
+        normalized_name = connector_name.lower()
+        if "binance_perpetual" in normalized_name:
+            hours = self._normalize_binance_interval(hours)
+        self._connector_interval_overrides[normalized_name] = hours
+
+    def _binance_symbol(self) -> str:
+        base, quote = split_hb_trading_pair(self.binance_trading_pair)
+        return f"{base}{quote}"
+
+    def _fetch_binance_interval_from_api(self) -> Optional[Decimal]:
+        symbol = self._binance_symbol()
+        url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=2"
+        try:
+            with urlopen(url, timeout=5) as response:
+                payload = response.read().decode("utf-8")
+            data = json.loads(payload)
+        except asyncio.CancelledError:
+            raise
+        except URLError:
+            self.logger().warning(
+                "Network error fetching Binance funding interval for %s",
+                symbol,
+                exc_info=True,
+            )
+            return None
+        except Exception:
+            self.logger().warning(
+                "Failed to fetch Binance funding interval for %s",
+                symbol,
+                exc_info=True,
+            )
+            return None
+        if not isinstance(data, list) or len(data) < 2:
+            return None
+        times = sorted(
+            int(entry["fundingTime"])
+            for entry in data
+            if isinstance(entry, dict) and "fundingTime" in entry
+        )
+        if len(times) < 2:
+            return None
+        interval_ms = abs(times[-1] - times[-2])
+        if interval_ms <= 0:
+            return None
+        interval_hours = Decimal(interval_ms) / Decimal("3600000")
+        return interval_hours
+
+    def _maybe_refresh_binance_interval(self, current_time: float):
+        connector_key = self.binance_connector_name.lower()
+        has_override = connector_key in self._connector_interval_overrides
+        if has_override and current_time - self._binance_interval_last_refresh < BINANCE_INTERVAL_REFRESH_SECONDS:
+            return
+        if current_time - self._binance_interval_last_refresh < BINANCE_INTERVAL_REFRESH_SECONDS:
+            return
+        try:
+            interval_hours = self._fetch_binance_interval_from_api()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            interval_hours = None
+        self._binance_interval_last_refresh = current_time
+        if interval_hours is not None:
+            self._set_connector_interval_override(self.binance_connector_name, interval_hours)
+
+    def _update_binance_interval_from_next_timestamp(self, next_timestamp: Optional[int], current_time: float):
+        if next_timestamp is None:
+            return
+        if (
+            self._binance_last_next_funding_ts is not None
+            and next_timestamp > self._binance_last_next_funding_ts
+        ):
+            interval_seconds = next_timestamp - self._binance_last_next_funding_ts
+            if interval_seconds > 0:
+                interval_hours = Decimal(interval_seconds) / Decimal(SECONDS_PER_HOUR)
+                self._set_connector_interval_override(self.binance_connector_name, interval_hours)
+                self._binance_interval_last_refresh = current_time
+        self._binance_last_next_funding_ts = next_timestamp
+
     def _monitor_funding_and_maybe_close(self):
         current_time = self.current_timestamp
         if current_time - self._last_funding_check_ts < 10:
             return
         self._last_funding_check_ts = current_time
-        hyper_seconds_remaining: Optional[int] = None
-        binance_seconds_remaining: Optional[int] = None
+        seconds_to_next_hour = self._seconds_to_next_hour(current_time)
+        self._latest_funding_eta = seconds_to_next_hour
+        self._latest_binance_funding_eta = seconds_to_next_hour
+        if seconds_to_next_hour > FUNDING_WINDOW_SECONDS:
+            return
         try:
             hyper_info = self.hyperliquid_connector.get_funding_info(self.hyperliquid_trading_pair)
         except Exception:
@@ -635,12 +763,8 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             self._latest_funding_rate = (
                 Decimal(str(hyper_info.rate)) if hyper_info.rate is not None else None
             )
-            sec = hyper_info.next_funding_utc_timestamp - int(current_time)
-            hyper_seconds_remaining = sec if sec >= 0 else None
-            self._latest_funding_eta = hyper_seconds_remaining
         else:
             self._latest_funding_rate = None
-            self._latest_funding_eta = None
 
         try:
             binance_info = self.binance_connector.get_funding_info(self.binance_trading_pair)
@@ -650,49 +774,45 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             self._latest_binance_funding_rate = (
                 Decimal(str(binance_info.rate)) if binance_info.rate is not None else None
             )
-            sec = binance_info.next_funding_utc_timestamp - int(current_time)
-            binance_seconds_remaining = sec if sec >= 0 else None
-            self._latest_binance_funding_eta = binance_seconds_remaining
+            binance_next_ts = getattr(binance_info, "next_funding_utc_timestamp", None)
+            self._update_binance_interval_from_next_timestamp(binance_next_ts, current_time)
         else:
             self._latest_binance_funding_rate = None
-            self._latest_binance_funding_eta = None
+        self._maybe_refresh_binance_interval(current_time)
+        hyper_hourly_rate = self._hourly_rate_for_connector(
+            self._latest_funding_rate,
+            self.hyperliquid_connector_name,
+        )
+        binance_hourly_rate = self._hourly_rate_for_connector(
+            self._latest_binance_funding_rate,
+            self.binance_connector_name,
+        )
 
-        hyper_near = (
-            hyper_seconds_remaining is not None and hyper_seconds_remaining <= FUNDING_WINDOW_SECONDS
-        )
-        binance_near = (
-            binance_seconds_remaining is not None and binance_seconds_remaining <= FUNDING_WINDOW_SECONDS
-        )
+        if hyper_hourly_rate is None or binance_hourly_rate is None:
+            return
 
         hyper_hourly_payout = self._funding_payout_value(
-            self._latest_funding_rate,
+            hyper_hourly_rate,
             self.hyperliquid_open_side,
         )
-        binance_payout = self._funding_payout_value(
-            self._latest_binance_funding_rate,
+        binance_hourly_payout = self._funding_payout_value(
+            binance_hourly_rate,
             self.binance_open_side,
         )
 
-        if hyper_near and not binance_near:
-            if hyper_hourly_payout is not None and hyper_hourly_payout <= Decimal("0"):
-                self.logger().info("Hyperliquid funding unfavorable near settlement. Closing hedge.")
-                self._initiate_closing("hyper funding unfavorable")
-        elif hyper_near and binance_near:
-            hyper_eight_hour = (
-                hyper_hourly_payout * HYPER_TO_BINANCE_HOUR_MULTIPLIER
-                if hyper_hourly_payout is not None
-                else None
+        if hyper_hourly_payout is None or binance_hourly_payout is None:
+            return
+
+        net_hourly_payout = hyper_hourly_payout + binance_hourly_payout
+        rate_diff = hyper_hourly_rate - binance_hourly_rate
+
+        if net_hourly_payout < Decimal("0"):
+            self.logger().info(
+                "Hourly funding unfavorable near settlement (rate_diff=%s, net_payout=%s). Closing hedge.",
+                self._format_decimal(rate_diff, precision=6, pct=True),
+                self._format_decimal(net_hourly_payout, precision=6, pct=True),
             )
-            components: List[Decimal] = []
-            if hyper_eight_hour is not None:
-                components.append(hyper_eight_hour)
-            if binance_payout is not None:
-                components.append(binance_payout)
-            if components:
-                combined = sum(components, Decimal("0"))
-                if combined <= Decimal("0"):
-                    self.logger().info("Combined funding unfavorable near dual settlement. Closing hedge.")
-                    self._initiate_closing("combined funding unfavorable")
+            self._initiate_closing("hourly funding unfavorable")
 
     def _initiate_closing(self, reason: str, resume_open: bool = False) -> bool:
         if self._stage in {"closing", "closed"}:
@@ -914,25 +1034,57 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
     def format_status(self) -> str:
         original_status = super().format_status()
         lines = []
-        lines.append(f"Stage: {self._stage}")
+        stage_labels = {
+            "not_started": "未开始",
+            "opening": "建仓中",
+            "hedged": "已对冲",
+            "closing": "平仓中",
+            "closed": "已完成",
+            "closing_failed": "平仓失败",
+        }
+        lines.append(f"当前阶段: {stage_labels.get(self._stage, self._stage)}")
         if self._stage in {"opening", "hedged", "closing"}:
-            lines.append(
-                f"Short leg: amount={self._format_decimal(self._short_filled_amount or Decimal('0'))} @ {self._format_decimal(self._short_entry_price) if self._short_entry_price else 'n/a'}"
+            hyper_interval = self._settlement_hours_for_connector(self.hyperliquid_connector_name)
+            binance_interval = self._settlement_hours_for_connector(self.binance_connector_name)
+            hyper_hourly_rate = self._hourly_rate_for_connector(
+                self._latest_funding_rate,
+                self.hyperliquid_connector_name,
+            )
+            binance_hourly_rate = self._hourly_rate_for_connector(
+                self._latest_binance_funding_rate,
+                self.binance_connector_name,
             )
             lines.append(
-                f"Long leg: amount={self._format_decimal(self._long_filled_amount or Decimal('0'))} @ {self._format_decimal(self._long_entry_price) if self._long_entry_price else 'n/a'}"
+                f"空腿仓位: 数量={self._format_decimal(self._short_filled_amount or Decimal('0'))} @ {self._format_decimal(self._short_entry_price) if self._short_entry_price else '暂缺'}"
+            )
+            lines.append(
+                f"多腿仓位: 数量={self._format_decimal(self._long_filled_amount or Decimal('0'))} @ {self._format_decimal(self._long_entry_price) if self._long_entry_price else '暂缺'}"
             )
             if self._latest_funding_rate is not None:
-                lines.append(f"Current funding (short leg): {self._format_decimal(self._latest_funding_rate, precision=6, pct=True)}")
+                lines.append(
+                    f"短腿最新资金费率: {self._format_decimal(self._latest_funding_rate, precision=6, pct=True)}"
+                )
+            if hyper_hourly_rate is not None:
+                lines.append(
+                    f"短腿小时化资金费率: {self._format_decimal(hyper_hourly_rate, precision=6, pct=True)}"
+                )
+            if hyper_interval is not None:
+                lines.append(f"短腿结算周期: {self._format_decimal(hyper_interval)} 小时")
             if self._latest_funding_eta is not None:
-                lines.append(f"Time to next funding (s): {self._latest_funding_eta}")
+                lines.append(f"距离下次短腿结算(秒): {self._latest_funding_eta}")
             if self._latest_binance_funding_rate is not None:
                 lines.append(
-                    f"Current funding (long leg): {self._format_decimal(self._latest_binance_funding_rate, precision=6, pct=True)}"
+                    f"长腿最新资金费率: {self._format_decimal(self._latest_binance_funding_rate, precision=6, pct=True)}"
                 )
+            if binance_hourly_rate is not None:
+                lines.append(
+                    f"长腿小时化资金费率: {self._format_decimal(binance_hourly_rate, precision=6, pct=True)}"
+                )
+            if binance_interval is not None:
+                lines.append(f"长腿结算周期: {self._format_decimal(binance_interval)} 小时")
             if self._latest_binance_funding_eta is not None:
-                lines.append(f"Time to next funding (long leg, s): {self._latest_binance_funding_eta}")
-            lines.append(f"Net funding accrual: {self._format_decimal(self._funding_total_quote)}")
+                lines.append(f"距离下次长腿结算(秒): {self._latest_binance_funding_eta}")
+            lines.append(f"累计资金费盈亏: {self._format_decimal(self._funding_total_quote)}")
         return original_status + "\n".join(lines)
 
     def close_positions(self):
