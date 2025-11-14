@@ -706,6 +706,26 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             hours = self._normalize_binance_interval(hours)
         self._connector_interval_overrides[normalized_name] = hours
 
+    def _seconds_to_next_binance_settlement(
+        self,
+        binance_info,
+        current_time: float,
+        fallback: int,
+    ) -> int:
+        next_ts = None
+        if binance_info is not None:
+            next_ts = getattr(binance_info, "next_funding_utc_timestamp", None)
+        if next_ts is None:
+            next_ts = self._binance_last_next_funding_ts
+        if next_ts is not None:
+            return max(0, int(next_ts - current_time))
+        interval_hours = self._settlement_hours_for_connector(self.binance_connector_name)
+        interval_seconds = int(interval_hours * SECONDS_PER_HOUR)
+        if interval_seconds <= 0:
+            return fallback
+        seconds_into_period = int(current_time) % interval_seconds
+        return interval_seconds - seconds_into_period
+
     def _binance_symbol(self) -> str:
         base, quote = split_hb_trading_pair(self.binance_trading_pair)
         return f"{base}{quote}"
@@ -784,11 +804,9 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         if current_time - self._last_funding_check_ts < 10:
             return
         self._last_funding_check_ts = current_time
-        seconds_to_next_hour = self._seconds_to_next_hour(current_time)
-        self._latest_funding_eta = seconds_to_next_hour
-        self._latest_binance_funding_eta = seconds_to_next_hour
-        if seconds_to_next_hour > FUNDING_WINDOW_SECONDS:
-            return
+        hyper_seconds_to_settlement = self._seconds_to_next_hour(current_time)
+        self._latest_funding_eta = hyper_seconds_to_settlement
+        binance_seconds_to_settlement = hyper_seconds_to_settlement
         try:
             hyper_info = self.hyperliquid_connector.get_funding_info(self.hyperliquid_trading_pair)
         except Exception:
@@ -810,9 +828,25 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             )
             binance_next_ts = getattr(binance_info, "next_funding_utc_timestamp", None)
             self._update_binance_interval_from_next_timestamp(binance_next_ts, current_time)
+            binance_seconds_to_settlement = self._seconds_to_next_binance_settlement(
+                binance_info,
+                current_time,
+                hyper_seconds_to_settlement,
+            )
         else:
             self._latest_binance_funding_rate = None
+            binance_seconds_to_settlement = self._seconds_to_next_binance_settlement(
+                None,
+                current_time,
+                hyper_seconds_to_settlement,
+            )
+        self._latest_binance_funding_eta = binance_seconds_to_settlement
         self._maybe_refresh_binance_interval(current_time)
+        if (
+            hyper_seconds_to_settlement > FUNDING_WINDOW_SECONDS
+            and binance_seconds_to_settlement > FUNDING_WINDOW_SECONDS
+        ):
+            return
         hyper_hourly_rate = self._hourly_rate_for_connector(
             self._latest_funding_rate,
             self.hyperliquid_connector_name,
@@ -821,9 +855,6 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             self._latest_binance_funding_rate,
             self.binance_connector_name,
         )
-
-        if hyper_hourly_rate is None or binance_hourly_rate is None:
-            return
 
         hyper_hourly_payout = self._funding_payout_value(
             hyper_hourly_rate,
@@ -834,9 +865,33 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             self.binance_open_side,
         )
 
+        hyper_in_window = hyper_seconds_to_settlement <= FUNDING_WINDOW_SECONDS
+        binance_in_window = binance_seconds_to_settlement <= FUNDING_WINDOW_SECONDS
+
+        if hyper_in_window and not binance_in_window:
+            if hyper_hourly_payout is None:
+                return
+            if hyper_hourly_payout < Decimal("0"):
+                self.logger().info(
+                    "Hyperliquid funding unfavorable near settlement (payout=%s). Closing hedge.",
+                    self._format_decimal(hyper_hourly_payout, precision=6, pct=True),
+                )
+                self._initiate_closing("hyperliquid funding unfavorable")
+            return
+        if binance_in_window and not hyper_in_window:
+            if binance_hourly_payout is None:
+                return
+            if binance_hourly_payout < Decimal("0"):
+                self.logger().info(
+                    "Binance funding unfavorable near settlement (payout=%s). Closing hedge.",
+                    self._format_decimal(binance_hourly_payout, precision=6, pct=True),
+                )
+                self._initiate_closing("binance funding unfavorable")
+            return
+        if not hyper_in_window or not binance_in_window:
+            return
         if hyper_hourly_payout is None or binance_hourly_payout is None:
             return
-
         net_hourly_payout = hyper_hourly_payout + binance_hourly_payout
         rate_diff = hyper_hourly_rate - binance_hourly_rate
 
