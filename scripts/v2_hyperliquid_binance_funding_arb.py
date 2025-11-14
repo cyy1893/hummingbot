@@ -46,14 +46,14 @@ class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
     hyperliquid_connector: str = Field(
         default="hyperliquid_perpetual",
         json_schema_extra={
-            "prompt": lambda _: "Connector for the Hyperliquid leg (e.g. hyperliquid_perpetual): ",
+            "prompt": lambda _: "Hyperliquid腿使用的连接器（例如 hyperliquid_perpetual）：",
             "prompt_on_new": True,
         },
     )
     binance_connector: str = Field(
         default="binance_perpetual",
         json_schema_extra={
-            "prompt": lambda _: "Connector for the Binance leg (e.g. binance_perpetual): ",
+            "prompt": lambda _: "Binance腿使用的连接器（例如 binance_perpetual）：",
             "prompt_on_new": True,
         },
     )
@@ -75,7 +75,7 @@ class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
         default=5,
         gt=0,
         json_schema_extra={
-            "prompt": lambda _: "Perpetual leverage to apply on both connectors (e.g. 5): ",
+            "prompt": lambda _: "两个连接器共同使用的永续杠杆（例如 5）：",
             "prompt_on_new": True,
         },
     )
@@ -83,21 +83,29 @@ class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
         default=Decimal("10"),
         gt=Decimal("0"),
         json_schema_extra={
-            "prompt": lambda _: "Target margin per leg, quoted in USD (e.g. 10): ",
+            "prompt": lambda _: "每条腿的目标保证金，美元计价（例如 10）：",
             "prompt_on_new": True,
+        },
+    )
+    min_entry_spread: Decimal = Field(
+        default=Decimal("5"),
+        ge=Decimal("0"),
+        json_schema_extra={
+            "prompt": lambda _: "开仓所需的空多价差，单位为基点（例如 5 表示 5 个基点）：",
+            "prompt_on_new": False,
         },
     )
     hyperliquid_position: Literal["long", "short"] = Field(
         default="long",
         json_schema_extra={
-            "prompt": lambda _: "Hyperliquid position direction (long/short): ",
+            "prompt": lambda _: "Hyperliquid 持仓方向（long/short）：",
             "prompt_on_new": True,
         },
     )
     binance_position: Literal["long", "short"] = Field(
         default="short",
         json_schema_extra={
-            "prompt": lambda _: "Binance position direction (long/short): ",
+            "prompt": lambda _: "Binance 持仓方向（long/short）：",
             "prompt_on_new": True,
         },
     )
@@ -109,8 +117,8 @@ class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
         else:
             connector_name = model_instance.binance_connector or "binance_perpetual"
         example = AllConnectorSettings.get_example_pairs().get(connector_name)
-        example_text = f" (e.g. {example})" if example else ""
-        return f"Enter the trading pair to use on {connector_name}{example_text}."
+        example_text = f"（例如 {example}）" if example else ""
+        return f"请输入 {connector_name} 的交易对{example_text}："
 
     @field_validator("hyperliquid_trading_pair", "binance_trading_pair", mode="after")
     @classmethod
@@ -196,6 +204,9 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         self.hyperliquid_close_side = TradeType.SELL if self.hyperliquid_open_side == TradeType.BUY else TradeType.BUY
         self.binance_open_side = TradeType.BUY if self.config.binance_position == "long" else TradeType.SELL
         self.binance_close_side = TradeType.SELL if self.binance_open_side == TradeType.BUY else TradeType.BUY
+        self._min_entry_spread = Decimal(str(self.config.min_entry_spread)) / Decimal("10000")
+        self._short_open_side: TradeType = TradeType.SELL
+        self._long_open_side: TradeType = TradeType.BUY
 
         self._assign_leg_roles()
 
@@ -278,6 +289,8 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             self.long_connector_name = self.binance_connector_name
             self.long_trading_pair = self.binance_trading_pair
             self.long_connector = self.binance_connector
+            self._short_open_side = self.hyperliquid_open_side
+            self._long_open_side = self.binance_open_side
         else:
             self.short_connector_name = self.binance_connector_name
             self.short_trading_pair = self.binance_trading_pair
@@ -285,6 +298,8 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             self.long_connector_name = self.hyperliquid_connector_name
             self.long_trading_pair = self.hyperliquid_trading_pair
             self.long_connector = self.hyperliquid_connector
+            self._short_open_side = self.binance_open_side
+            self._long_open_side = self.hyperliquid_open_side
 
     def _leg_for_connector_name(self, connector_name: str) -> str:
         return "short" if connector_name == self.short_connector_name else "long"
@@ -508,6 +523,10 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
 
             target_price = self._apply_price_rules(market_price, rule, side)
             if target_price is None or target_price <= Decimal("0"):
+                await asyncio.sleep(0.5)
+                continue
+
+            if stage == "open" and not self._meets_entry_spread_requirement(leg, stage, target_price):
                 await asyncio.sleep(0.5)
                 continue
 
@@ -1154,6 +1173,45 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             else:
                 price = price + step
         return price if price > Decimal("0") else None
+
+    def _estimate_price_from_cache(self, leg: str) -> Optional[Decimal]:
+        price = self._last_short_price if leg == "short" else self._last_long_price
+        rule = self._short_trading_rule if leg == "short" else self._long_trading_rule
+        side = self._short_open_side if leg == "short" else self._long_open_side
+        if price is None or price <= Decimal("0"):
+            return None
+        if rule is None:
+            return price
+        return self._apply_price_rules(price, rule, side)
+
+    def _counterpart_reference_price(self, leg: str) -> Optional[Decimal]:
+        if leg == "short":
+            sources = [
+                self._long_entry_price,
+                self._long_open_order_price,
+                self._estimate_price_from_cache("long"),
+            ]
+        else:
+            sources = [
+                self._short_entry_price,
+                self._short_open_order_price,
+                self._estimate_price_from_cache("short"),
+            ]
+        for value in sources:
+            if value is not None and value > Decimal("0"):
+                return value
+        return None
+
+    def _meets_entry_spread_requirement(self, leg: str, stage: str, candidate_price: Decimal) -> bool:
+        if stage != "open" or self._min_entry_spread <= Decimal("0"):
+            return True
+        counterpart_price = self._counterpart_reference_price(leg)
+        if counterpart_price is None or counterpart_price <= Decimal("0"):
+            return False
+        ratio = Decimal("1") + self._min_entry_spread
+        if leg == "short":
+            return candidate_price >= counterpart_price * ratio
+        return candidate_price <= counterpart_price / ratio
 
     def _adjust_amount_for_rule(
         self,
