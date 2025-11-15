@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
-from typing import Dict, List, Literal, Optional, Set
+from typing import Dict, List, Literal, Optional, Set, Tuple
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -58,14 +58,14 @@ class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
         },
     )
     hyperliquid_trading_pair: str = Field(
-        default="SOL-USDC",
+        default="SOL-USD",
         json_schema_extra={
             "prompt": lambda mi: HyperliquidBinancePerpConfig.trading_pair_prompt(mi, leg="hyperliquid"),
             "prompt_on_new": True,
         },
     )
     binance_trading_pair: str = Field(
-        default="SOL-USDT",
+        default="SOL-USDC",
         json_schema_extra={
             "prompt": lambda mi: HyperliquidBinancePerpConfig.trading_pair_prompt(mi, leg="binance"),
             "prompt_on_new": True,
@@ -92,7 +92,7 @@ class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
         ge=Decimal("0"),
         json_schema_extra={
             "prompt": lambda _: "开仓所需的空多价差，单位为基点（例如 5 表示 5 个基点）：",
-            "prompt_on_new": False,
+            "prompt_on_new": True,
         },
     )
     hyperliquid_position: Literal["long", "short"] = Field(
@@ -191,7 +191,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         binance_base, _ = split_hb_trading_pair(self.binance_trading_pair)
         if hyper_base != binance_base:
             self.logger().warning(
-                "Configured trading pairs use different base assets (%s vs %s). Exposure may not remain hedged.",
+                "配置的交易对基础资产不一致（%s vs %s），敞口可能无法完全对冲。",
                 hyper_base,
                 binance_base,
             )
@@ -204,11 +204,19 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         self.hyperliquid_close_side = TradeType.SELL if self.hyperliquid_open_side == TradeType.BUY else TradeType.BUY
         self.binance_open_side = TradeType.BUY if self.config.binance_position == "long" else TradeType.SELL
         self.binance_close_side = TradeType.SELL if self.binance_open_side == TradeType.BUY else TradeType.BUY
-        self._min_entry_spread = Decimal(str(self.config.min_entry_spread)) / Decimal("10000")
+        self._min_entry_spread_bps = Decimal(str(self.config.min_entry_spread))
+        self._min_entry_spread = self._min_entry_spread_bps / Decimal("10000")
         self._short_open_side: TradeType = TradeType.SELL
         self._long_open_side: TradeType = TradeType.BUY
 
         self._assign_leg_roles()
+        self.logger().info(
+            "Hyperliquid-Binance 资金费套利脚本启动，空头连接器=%s， 多头连接器=%s，要求价差=%s 基点。",
+            self.short_connector_name,
+            self.long_connector_name,
+            self._format_decimal(self._min_entry_spread_bps, precision=4, pct=False),
+        )
+        self._spread_eval_state = {"short": (None, None), "long": (None, None)}
 
         self._operation_task: Optional[asyncio.Task] = None
         self._closing_task: Optional[asyncio.Task] = None
@@ -274,12 +282,12 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 if hasattr(connector, "set_position_mode"):
                     connector.set_position_mode(PositionMode.ONEWAY)
             except Exception:
-                self.logger().warning("Failed to set position mode for %s %s", connector_name, trading_pair)
+                self.logger().warning("无法为 %s %s 设置持仓模式。", connector_name, trading_pair)
             try:
                 if hasattr(connector, "set_leverage"):
                     connector.set_leverage(trading_pair, self.config.leverage)
             except Exception:
-                self.logger().warning("Failed to set leverage for %s %s", connector_name, trading_pair)
+                self.logger().warning("无法为 %s %s 设置杠杆。", connector_name, trading_pair)
 
     def _assign_leg_roles(self):
         if self.hyperliquid_open_side == TradeType.SELL:
@@ -342,10 +350,10 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 self.binance_open_side,
             )
             if hyper_price is None or hyper_price <= Decimal("0"):
-                self.logger().warning("Unable to fetch price on %s when opening.", self.hyperliquid_connector_name)
+                self.logger().warning("开仓阶段无法获取 %s 的行情价格。", self.hyperliquid_connector_name)
                 return
             if binance_price is None or binance_price <= Decimal("0"):
-                self.logger().warning("Unable to fetch price on %s when opening.", self.binance_connector_name)
+                self.logger().warning("开仓阶段无法获取 %s 的行情价格。", self.binance_connector_name)
                 return
 
             margin_target = Decimal(str(self.config.order_value_quote))
@@ -368,10 +376,10 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             )
 
             if hyper_amount is None or hyper_amount <= Decimal("0"):
-                self.logger().warning("Hyperliquid leg amount below trading rule minimum; aborting open.")
+                self.logger().warning("Hyperliquid 侧数量低于最小下单要求，取消本次开仓。")
                 return
             if binance_amount is None or binance_amount <= Decimal("0"):
-                self.logger().warning("Binance leg amount below trading rule minimum; aborting open.")
+                self.logger().warning("Binance 侧数量低于最小下单要求，取消本次开仓。")
                 return
 
             hyper_amount_dec = Decimal(str(hyper_amount))
@@ -394,10 +402,12 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             short_price = prices_by_connector[self.short_connector_name]
             long_price = prices_by_connector[self.long_connector_name]
             self.logger().info(
-                "Launching concurrent hedged open: short %s %s @ %s, long %s %s @ %s.",
+                "启动并行对冲建仓：空头(%s) 数量=%s %s，当前盘口价=%s；多头(%s) 数量=%s %s，当前盘口价=%s。",
+                self.short_connector_name,
                 self._format_decimal(self._short_target_amount),
                 self.base_asset,
                 self._format_decimal(short_price),
+                self.long_connector_name,
                 self._format_decimal(self._long_target_amount),
                 self.base_asset,
                 self._format_decimal(long_price),
@@ -425,9 +435,9 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             )
             open_success = all(open_results)
             if open_success:
-                self.logger().info("Hedge established; awaiting funding accrual.")
+                self.logger().info("双向仓位已建立，等待资金费用结算。")
         except Exception as exc:
-            self.logger().error("Exception during opening cycle: %s", exc, exc_info=True)
+            self.logger().error("建仓流程出现异常: %s", exc, exc_info=True)
         finally:
             if open_success and self._short_fill_event.is_set() and self._long_fill_event.is_set():
                 self._stage = "hedged"
@@ -435,7 +445,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             else:
                 await self._cancel_active_orders()
                 if self._has_open_exposure():
-                    self.logger().warning("Opening leg mismatch detected; flattening before next attempt.")
+                    self.logger().warning("检测到两条腿成交不一致，先平掉残余头寸后再尝试。")
                     started = self._initiate_closing("partial fill recovery", resume_open=True)
                     if not started:
                         self._stage = "not_started"
@@ -526,9 +536,12 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 await asyncio.sleep(0.5)
                 continue
 
-            if stage == "open" and not self._meets_entry_spread_requirement(leg, stage, target_price):
-                await asyncio.sleep(0.5)
-                continue
+            if stage == "open":
+                is_favorable, reason = self._evaluate_entry_spread(leg, target_price)
+                self._log_spread_evaluation(leg, stage, is_favorable, reason)
+                if not is_favorable:
+                    await asyncio.sleep(0.5)
+                    continue
 
             if active_order_id is not None:
                 await self._cancel_order(connector_name, trading_pair, active_order_id)
@@ -622,11 +635,11 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 position_action=position_action,
             )
         self.logger().debug(
-            "Placed %s order %s on %s %s price %s amount %s",
-            "buy" if side == TradeType.BUY else "sell",
-            order_id,
+            "在 %s %s 提交%s单 %s，价格 %s，数量 %s",
             connector_name,
             trading_pair,
+            "买" if side == TradeType.BUY else "卖",
+            order_id,
             price,
             amount,
         )
@@ -640,7 +653,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             self.cancel(connector_name, trading_pair, order_id)
         except Exception:
             self._strategy_cancelled_orders.discard(order_id)
-            self.logger().warning("Failed to cancel order %s on %s %s", order_id, connector_name, trading_pair, exc_info=True)
+            self.logger().warning("撤单失败：订单 %s（%s %s）", order_id, connector_name, trading_pair, exc_info=True)
         await asyncio.sleep(0.1)
 
     async def _cancel_active_orders(self):
@@ -741,14 +754,14 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             raise
         except URLError:
             self.logger().warning(
-                "Network error fetching Binance funding interval for %s",
+                "获取 Binance %s 的资金费周期时发生网络错误。",
                 symbol,
                 exc_info=True,
             )
             return None
         except Exception:
             self.logger().warning(
-                "Failed to fetch Binance funding interval for %s",
+                "无法获取 Binance %s 的资金费周期。",
                 symbol,
                 exc_info=True,
             )
@@ -873,7 +886,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 return
             if hyper_hourly_payout < Decimal("0"):
                 self.logger().info(
-                    "Hyperliquid funding unfavorable near settlement (payout=%s). Closing hedge.",
+                    "Hyperliquid 侧即将结算，预计资金费支出为 %s，执行平仓。",
                     self._format_decimal(hyper_hourly_payout, precision=6, pct=True),
                 )
                 self._initiate_closing("hyperliquid funding unfavorable")
@@ -883,7 +896,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 return
             if binance_hourly_payout < Decimal("0"):
                 self.logger().info(
-                    "Binance funding unfavorable near settlement (payout=%s). Closing hedge.",
+                    "Binance 侧即将结算，预计资金费支出为 %s，执行平仓。",
                     self._format_decimal(binance_hourly_payout, precision=6, pct=True),
                 )
                 self._initiate_closing("binance funding unfavorable")
@@ -897,7 +910,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
 
         if net_hourly_payout < Decimal("0"):
             self.logger().info(
-                "Hourly funding unfavorable near settlement (rate_diff=%s, net_payout=%s). Closing hedge.",
+                "双方即将结算，资金费净收益为负（差值=%s，净收益=%s），执行平仓。",
                 self._format_decimal(rate_diff, precision=6, pct=True),
                 self._format_decimal(net_hourly_payout, precision=6, pct=True),
             )
@@ -909,9 +922,9 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         if self._closing_task is not None and not self._closing_task.done():
             return False
         if not self._has_open_exposure():
-            self.logger().warning("Cannot close hedge; no filled amount recorded.")
+            self.logger().warning("无法平仓：未记录到任何已成交的对冲头寸。")
             return False
-        self.logger().info("Starting concurrent close: %s", reason)
+        self.logger().info("开始并行平仓：%s", reason)
         self._short_close_fill_event = asyncio.Event()
         self._long_close_fill_event = asyncio.Event()
         self._short_close_order_id = None
@@ -949,7 +962,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             long_close_amount = connector_close_amounts[self.long_connector_name]
 
             if short_close_amount <= Decimal("0") and long_close_amount <= Decimal("0"):
-                self.logger().info("No positions detected; marking hedge as closed.")
+                self.logger().info("未检测到持仓，标记为已平仓。")
                 if not self._closing_recovery:
                     self._stage = "closed"
                     self._execution_completed = True
@@ -978,13 +991,13 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             )
             closing_success = all(close_results)
             if closing_success:
-                self.logger().info("Hedge closed successfully.")
+                self.logger().info("对冲仓位已成功平掉。")
             else:
-                self.logger().warning("Closing tasks did not fully succeed (results=%s).", close_results)
+                self.logger().warning("平仓任务未全部成功（结果=%s）。", close_results)
             if not self._closing_recovery:
                 self._stage = "closed"
         except Exception as exc:
-            self.logger().error("Exception while closing positions: %s", exc, exc_info=True)
+            self.logger().error("平仓流程出现异常: %s", exc, exc_info=True)
             self._stage = "closing_failed"
         finally:
             if self._closing_recovery:
@@ -1025,7 +1038,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         amount = Decimal(str(event.amount))
         self._funding_total_quote += amount
         self.logger().info(
-            "Funding payment %s %s on %s. Cumulative funding: %s",
+            "收到资金费 %s %s（%s），当前累计资金费: %s",
             self._format_decimal(amount),
             event.trading_pair.split("-")[-1],
             event.market,
@@ -1108,13 +1121,13 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         error_message = getattr(event, "error_message", "") or ""
         if stage == "open" and self._is_post_only_rejection(error_message):
             self.logger().debug(
-                "Order %s (%s, %s) rejected as taker risk (post-only). Will reprice.",
+                "订单 %s（%s腿，阶段=%s）因触发吃单风险被拒绝，将重新定价。",
                 event.order_id,
                 leg,
                 stage,
             )
             return
-        self.logger().warning("Order %s (%s, %s) failed. Resetting state.", event.order_id, leg, stage)
+        self.logger().warning("订单 %s（%s腿，阶段=%s）执行失败，策略状态将被重置。", event.order_id, leg, stage)
         if stage == "open":
             self._stage = "not_started"
         else:
@@ -1144,10 +1157,10 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 self.binance_connector_name,
             )
             lines.append(
-                f"空腿仓位: 数量={self._format_decimal(self._short_filled_amount or Decimal('0'))} @ {self._format_decimal(self._short_entry_price) if self._short_entry_price else '暂缺'}"
+                f"空头仓位: 数量={self._format_decimal(self._short_filled_amount or Decimal('0'))} @ {self._format_decimal(self._short_entry_price) if self._short_entry_price else '暂缺'}"
             )
             lines.append(
-                f"多腿仓位: 数量={self._format_decimal(self._long_filled_amount or Decimal('0'))} @ {self._format_decimal(self._long_entry_price) if self._long_entry_price else '暂缺'}"
+                f"多头仓位: 数量={self._format_decimal(self._long_filled_amount or Decimal('0'))} @ {self._format_decimal(self._long_entry_price) if self._long_entry_price else '暂缺'}"
             )
             if self._latest_funding_rate is not None:
                 lines.append(
@@ -1257,16 +1270,48 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 return value
         return None
 
-    def _meets_entry_spread_requirement(self, leg: str, stage: str, candidate_price: Decimal) -> bool:
-        if stage != "open" or self._min_entry_spread <= Decimal("0"):
-            return True
+    def _evaluate_entry_spread(self, leg: str, candidate_price: Decimal) -> Tuple[bool, str]:
+        if self._min_entry_spread <= Decimal("0"):
+            return True, "未启用价差要求"
         counterpart_price = self._counterpart_reference_price(leg)
         if counterpart_price is None or counterpart_price <= Decimal("0"):
-            return False
+            return False, "对手腿参考价格不可用"
         ratio = Decimal("1") + self._min_entry_spread
         if leg == "short":
-            return candidate_price >= counterpart_price * ratio
-        return candidate_price <= counterpart_price / ratio
+            required = counterpart_price * ratio
+            if candidate_price >= required:
+                return True, (
+                    f"空头候选价 {self._format_decimal(candidate_price)} ≥ 多头参考价 {self._format_decimal(counterpart_price)}"
+                    f" × (1+{self._format_decimal(self._min_entry_spread, precision=6, pct=True)})"
+                )
+            else:
+                return False, (
+                    f"空头候选价 {self._format_decimal(candidate_price)} < 多头参考价 {self._format_decimal(counterpart_price)}"
+                    f" × (1+{self._format_decimal(self._min_entry_spread, precision=6, pct=True)})"
+                )
+        else:
+            required = counterpart_price / ratio
+            if candidate_price <= required:
+                return True, (
+                    f"多头候选价 {self._format_decimal(candidate_price)} ≤ 空头参考价 {self._format_decimal(counterpart_price)}"
+                    f" ÷ (1+{self._format_decimal(self._min_entry_spread, precision=6, pct=True)})"
+                )
+            else:
+                return False, (
+                    f"多头候选价 {self._format_decimal(candidate_price)} > 空头参考价 {self._format_decimal(counterpart_price)}"
+                    f" ÷ (1+{self._format_decimal(self._min_entry_spread, precision=6, pct=True)})"
+                )
+
+    def _log_spread_evaluation(self, leg: str, stage: str, is_favorable: bool, reason: str):
+        state = self._spread_eval_state.get(leg)
+        new_state = (is_favorable, reason)
+        if state == new_state:
+            return
+        leg_label = "空头" if leg == "short" else "多头"
+        stage_label = "开仓" if stage == "open" else stage
+        verdict = "符合" if is_favorable else "不符合"
+        self.logger().info("价差判定[%s-%s]：%s条件，原因：%s", leg_label, stage_label, verdict, reason)
+        self._spread_eval_state[leg] = new_state
 
     def _adjust_amount_for_rule(
         self,
