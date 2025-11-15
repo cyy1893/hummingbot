@@ -35,6 +35,7 @@ CONNECTOR_FUNDING_INTERVAL_HOURS: Dict[str, Decimal] = {
 }
 BINANCE_INTERVAL_REFRESH_SECONDS = 1800
 BINANCE_ALLOWED_INTERVALS_HOURS = {Decimal("1"), Decimal("2"), Decimal("4"), Decimal("8")}
+RETRY_DELAY_SECONDS = 0.1
 
 
 class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
@@ -528,16 +529,19 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         while True:
             market_price = self._get_market_price(connector_name, trading_pair, side)
             if market_price is None or market_price <= Decimal("0"):
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
 
             target_price = self._apply_price_rules(market_price, rule, side)
             if target_price is None or target_price <= Decimal("0"):
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
 
             if stage == "open":
                 is_favorable, reason = self._evaluate_entry_spread(leg, target_price)
                 self._log_spread_evaluation(leg, stage, is_favorable, reason)
                 if not is_favorable:
+                    await asyncio.sleep(RETRY_DELAY_SECONDS)
                     continue
 
             if active_order_id is not None:
@@ -651,6 +655,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         except Exception:
             self._strategy_cancelled_orders.discard(order_id)
             self.logger().warning("撤单失败：订单 %s（%s %s）", order_id, connector_name, trading_pair, exc_info=True)
+        await asyncio.sleep(RETRY_DELAY_SECONDS)
 
     async def _cancel_active_orders(self):
         tasks = []
