@@ -88,10 +88,10 @@ class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
         },
     )
     min_entry_spread: Decimal = Field(
-        default=Decimal("5"),
+        default=Decimal("1"),
         ge=Decimal("0"),
         json_schema_extra={
-            "prompt": lambda _: "开仓所需的空多价差，单位为基点（例如 5 表示 5 个基点）：",
+            "prompt": lambda _: "开仓所需的空多价差，单位为基点（例如 1 表示 1 个基点）：",
             "prompt_on_new": True,
         },
     )
@@ -216,7 +216,8 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             self.long_connector_name,
             self._format_decimal(self._min_entry_spread_bps, precision=4, pct=False),
         )
-        self._spread_eval_state = {"short": (None, None), "long": (None, None)}
+        self._spread_eval_state: Dict[str, Optional[Tuple[bool, str]]] = {"short": None, "long": None}
+        self._spread_eval_last_log_ts: Dict[str, float] = {"short": 0.0, "long": 0.0}
 
         self._operation_task: Optional[asyncio.Task] = None
         self._closing_task: Optional[asyncio.Task] = None
@@ -528,19 +529,16 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         while True:
             market_price = self._get_market_price(connector_name, trading_pair, side)
             if market_price is None or market_price <= Decimal("0"):
-                await asyncio.sleep(0.5)
                 continue
 
             target_price = self._apply_price_rules(market_price, rule, side)
             if target_price is None or target_price <= Decimal("0"):
-                await asyncio.sleep(0.5)
                 continue
 
             if stage == "open":
                 is_favorable, reason = self._evaluate_entry_spread(leg, target_price)
                 self._log_spread_evaluation(leg, stage, is_favorable, reason)
                 if not is_favorable:
-                    await asyncio.sleep(0.5)
                     continue
 
             if active_order_id is not None:
@@ -1303,15 +1301,18 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 )
 
     def _log_spread_evaluation(self, leg: str, stage: str, is_favorable: bool, reason: str):
-        state = self._spread_eval_state.get(leg)
         new_state = (is_favorable, reason)
-        if state == new_state:
+        last_state = self._spread_eval_state.get(leg)
+        current_time = self.current_timestamp or 0
+        last_log_time = self._spread_eval_last_log_ts.get(leg, 0)
+        if last_state == new_state and current_time - last_log_time < 10:
             return
         leg_label = "空头" if leg == "short" else "多头"
         stage_label = "开仓" if stage == "open" else stage
         verdict = "符合" if is_favorable else "不符合"
         self.logger().info("价差判定[%s-%s]：%s条件，原因：%s", leg_label, stage_label, verdict, reason)
         self._spread_eval_state[leg] = new_state
+        self._spread_eval_last_log_ts[leg] = current_time
 
     def _adjust_amount_for_rule(
         self,
