@@ -88,10 +88,10 @@ class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
         },
     )
     min_entry_spread: Decimal = Field(
-        default=Decimal("5"),
+        default=Decimal("1"),
         ge=Decimal("0"),
         json_schema_extra={
-            "prompt": lambda _: "开仓所需的空多价差，单位为基点（例如 5 表示 5 个基点）：",
+            "prompt": lambda _: "开仓所需的空多价差，单位为基点（例如 1 表示 1 个基点）：",
             "prompt_on_new": True,
         },
     )
@@ -528,19 +528,16 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         while True:
             market_price = self._get_market_price(connector_name, trading_pair, side)
             if market_price is None or market_price <= Decimal("0"):
-                await asyncio.sleep(0.5)
                 continue
 
             target_price = self._apply_price_rules(market_price, rule, side)
             if target_price is None or target_price <= Decimal("0"):
-                await asyncio.sleep(0.5)
                 continue
 
             if stage == "open":
                 is_favorable, reason = self._evaluate_entry_spread(leg, target_price)
                 self._log_spread_evaluation(leg, stage, is_favorable, reason)
                 if not is_favorable:
-                    await asyncio.sleep(0.5)
                     continue
 
             if active_order_id is not None:
@@ -654,7 +651,6 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         except Exception:
             self._strategy_cancelled_orders.discard(order_id)
             self.logger().warning("撤单失败：订单 %s（%s %s）", order_id, connector_name, trading_pair, exc_info=True)
-        await asyncio.sleep(0.1)
 
     async def _cancel_active_orders(self):
         tasks = []
