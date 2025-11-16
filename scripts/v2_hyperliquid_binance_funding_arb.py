@@ -24,7 +24,7 @@ from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 
-FUNDING_WINDOW_SECONDS = 60
+FUNDING_WINDOW_SECONDS = 180
 SECONDS_PER_HOUR = 3600
 DEFAULT_FUNDING_INTERVAL_HOURS = Decimal("1")
 CONNECTOR_FUNDING_INTERVAL_HOURS: Dict[str, Decimal] = {
@@ -72,27 +72,34 @@ class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
             "prompt_on_new": True,
         },
     )
-    leverage: int = Field(
+    hyperliquid_leverage: int = Field(
         default=5,
         gt=0,
         json_schema_extra={
-            "prompt": lambda _: "两个连接器共同使用的永续杠杆（例如 5）：",
+            "prompt": lambda _: "Hyperliquid 杠杆（例如 5）：",
             "prompt_on_new": True,
         },
     )
-    order_value_quote: Decimal = Field(
-        default=Decimal("10"),
+    binance_leverage: int = Field(
+        default=10,
+        gt=0,
+        json_schema_extra={
+            "prompt": lambda _: "Binance 杠杆（例如 10）：",
+            "prompt_on_new": True,
+        },
+    )
+    order_notional_quote: Decimal = Field(
+        default=Decimal("100"),
         gt=Decimal("0"),
         json_schema_extra={
-            "prompt": lambda _: "每条腿的目标保证金，美元计价（例如 10）：",
+            "prompt": lambda _: "每条腿的合约名义价值（美元计价，如 USD/USDT/USDC），例如 10：",
             "prompt_on_new": True,
         },
     )
-    min_entry_spread: Decimal = Field(
-        default=Decimal("1"),
-        ge=Decimal("0"),
+    avoid_unfavorable_spread: bool = Field(
+        default=True,
         json_schema_extra={
-            "prompt": lambda _: "开仓所需的空多价差，单位为基点（例如 1 表示 1 个基点）：",
+            "prompt": lambda _: "是否避免建仓时的多头价高于空头价？(yes/no)：",
             "prompt_on_new": True,
         },
     )
@@ -205,19 +212,18 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         self.hyperliquid_close_side = TradeType.SELL if self.hyperliquid_open_side == TradeType.BUY else TradeType.BUY
         self.binance_open_side = TradeType.BUY if self.config.binance_position == "long" else TradeType.SELL
         self.binance_close_side = TradeType.SELL if self.binance_open_side == TradeType.BUY else TradeType.BUY
-        self._min_entry_spread_bps = Decimal(str(self.config.min_entry_spread))
-        self._min_entry_spread = self._min_entry_spread_bps / Decimal("10000")
+        self._avoid_unfavorable_spread = bool(self.config.avoid_unfavorable_spread)
         self._short_open_side: TradeType = TradeType.SELL
         self._long_open_side: TradeType = TradeType.BUY
 
         self._assign_leg_roles()
         self.logger().info(
-            "Hyperliquid-Binance 资金费套利脚本启动，空头连接器=%s， 多头连接器=%s，要求价差=%s 基点。",
+            "Hyperliquid-Binance 资金费套利脚本启动，空头连接器=%s，多头连接器=%s，避免不利价差=%s。",
             self.short_connector_name,
             self.long_connector_name,
-            self._format_decimal(self._min_entry_spread_bps, precision=4, pct=False),
+            "是" if self._avoid_unfavorable_spread else "否",
         )
-        self._spread_eval_state = {"short": (None, None), "long": (None, None)}
+        self._spread_eval_state = {"short": None, "long": None}
 
         self._operation_task: Optional[asyncio.Task] = None
         self._closing_task: Optional[asyncio.Task] = None
@@ -286,7 +292,12 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 self.logger().warning("无法为 %s %s 设置持仓模式。", connector_name, trading_pair)
             try:
                 if hasattr(connector, "set_leverage"):
-                    connector.set_leverage(trading_pair, self.config.leverage)
+                    leverage_to_set = (
+                        self.config.hyperliquid_leverage
+                        if connector_name == self.hyperliquid_connector_name
+                        else self.config.binance_leverage
+                    )
+                    connector.set_leverage(trading_pair, leverage_to_set)
             except Exception:
                 self.logger().warning("无法为 %s %s 设置杠杆。", connector_name, trading_pair)
 
@@ -357,23 +368,20 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                 self.logger().warning("开仓阶段无法获取 %s 的行情价格。", self.binance_connector_name)
                 return
 
-            margin_target = Decimal(str(self.config.order_value_quote))
-            leverage_decimal = Decimal(str(self.config.leverage))
-            hyper_amount = self._calculate_amount_from_margin(
+            notional_target = Decimal(str(self.config.order_notional_quote))
+            hyper_amount = self._calculate_amount_from_notional(
                 connector_name=self.hyperliquid_connector_name,
                 trading_pair=self.hyperliquid_trading_pair,
                 side=self.hyperliquid_open_side,
-                target_margin=margin_target,
+                target_notional=notional_target,
                 price=hyper_price,
-                leverage=leverage_decimal,
             )
-            binance_amount = self._calculate_amount_from_margin(
+            binance_amount = self._calculate_amount_from_notional(
                 connector_name=self.binance_connector_name,
                 trading_pair=self.binance_trading_pair,
                 side=self.binance_open_side,
-                target_margin=margin_target,
+                target_notional=notional_target,
                 price=binance_price,
-                leverage=leverage_decimal,
             )
 
             if hyper_amount is None or hyper_amount <= Decimal("0"):
@@ -396,7 +404,6 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
 
             self._short_target_amount = connector_amounts[self.short_connector_name]
             self._long_target_amount = connector_amounts[self.long_connector_name]
-            notional_target = margin_target * leverage_decimal
             self._short_target_notional = notional_target
             self._long_target_notional = notional_target
 
@@ -885,20 +892,28 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         if hyper_in_window and not binance_in_window:
             if hyper_hourly_payout is None:
                 return
-            if hyper_hourly_payout < Decimal("0"):
+            net_hourly_payout = hyper_hourly_payout
+            if binance_hourly_payout is not None:
+                net_hourly_payout += binance_hourly_payout
+            if hyper_hourly_payout < Decimal("0") and net_hourly_payout < Decimal("0"):
                 self.logger().info(
-                    "Hyperliquid 侧即将结算，预计资金费支出为 %s，执行平仓。",
+                    "Hyperliquid 侧即将结算，预计资金费支出为 %s，双方合计资金费为 %s，执行平仓。",
                     self._format_decimal(hyper_hourly_payout, precision=6, pct=True),
+                    self._format_decimal(net_hourly_payout, precision=6, pct=True),
                 )
                 self._initiate_closing("hyperliquid funding unfavorable")
             return
         if binance_in_window and not hyper_in_window:
             if binance_hourly_payout is None:
                 return
-            if binance_hourly_payout < Decimal("0"):
+            net_hourly_payout = binance_hourly_payout
+            if hyper_hourly_payout is not None:
+                net_hourly_payout += hyper_hourly_payout
+            if binance_hourly_payout < Decimal("0") and net_hourly_payout < Decimal("0"):
                 self.logger().info(
-                    "Binance 侧即将结算，预计资金费支出为 %s，执行平仓。",
+                    "Binance 侧即将结算，预计资金费支出为 %s，双方合计资金费为 %s，执行平仓。",
                     self._format_decimal(binance_hourly_payout, precision=6, pct=True),
+                    self._format_decimal(net_hourly_payout, precision=6, pct=True),
                 )
                 self._initiate_closing("binance funding unfavorable")
             return
@@ -1120,13 +1135,17 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             return
         leg, stage = owner
         error_message = getattr(event, "error_message", "") or ""
-        if stage == "open" and self._is_post_only_rejection(error_message):
+        order_id_attr, _, fill_event = self._leg_attributes(leg, stage)
+        setattr(self, order_id_attr, None)
+        if self._is_post_only_rejection(error_message):
             self.logger().debug(
                 "订单 %s（%s腿，阶段=%s）因触发吃单风险被拒绝，将重新定价。",
                 event.order_id,
                 leg,
                 stage,
             )
+            if fill_event.is_set():
+                fill_event.clear()
             return
         self.logger().warning("订单 %s（%s腿，阶段=%s）执行失败，策略状态将被重置。", event.order_id, leg, stage)
         if stage == "open":
@@ -1193,14 +1212,13 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
     def close_positions(self):
         self._initiate_closing("user requested close")
 
-    def _calculate_amount_from_margin(
+    def _calculate_amount_from_notional(
         self,
         connector_name: str,
         trading_pair: str,
         side: TradeType,
-        target_margin: Decimal,
+        target_notional: Decimal,
         price: Decimal,
-        leverage: Decimal,
     ) -> Optional[Decimal]:
         leg = self._leg_for_connector_name(connector_name)
         rule = self._short_trading_rule if leg == "short" else self._long_trading_rule
@@ -1208,8 +1226,7 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
             return None
         if price is None or price <= Decimal("0"):
             return None
-        notional_target = target_margin * leverage
-        amount = notional_target / price
+        amount = target_notional / price
         amount = self._adjust_amount_for_rule(amount, price, rule, round_up=True, ensure_min_notional=True)
         return amount
 
@@ -1272,35 +1289,30 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
         return None
 
     def _evaluate_entry_spread(self, leg: str, candidate_price: Decimal) -> Tuple[bool, str]:
-        if self._min_entry_spread <= Decimal("0"):
-            return True, "未启用价差要求"
+        if not self._avoid_unfavorable_spread:
+            return True, "未启用价差避险"
         counterpart_price = self._counterpart_reference_price(leg)
         if counterpart_price is None or counterpart_price <= Decimal("0"):
             return False, "对手腿参考价格不可用"
-        ratio = Decimal("1") + self._min_entry_spread
         if leg == "short":
-            required = counterpart_price * ratio
-            if candidate_price >= required:
+            # 不利价差定义：多头成交价高于空头成交价。开空时要求空头价 ≥ 多头参考价。
+            if candidate_price >= counterpart_price:
                 return True, (
-                    f"空头候选价 {self._format_decimal(candidate_price)} ≥ 多头参考价 {self._format_decimal(counterpart_price)}"
-                    f" × (1+{self._format_decimal(self._min_entry_spread, precision=6, pct=True)})"
+                    f"空头候选价 {self._format_decimal(candidate_price)} ≥ 多头参考价 {self._format_decimal(counterpart_price)}，不会产生不利价差"
                 )
             else:
                 return False, (
-                    f"空头候选价 {self._format_decimal(candidate_price)} < 多头参考价 {self._format_decimal(counterpart_price)}"
-                    f" × (1+{self._format_decimal(self._min_entry_spread, precision=6, pct=True)})"
+                    f"空头候选价 {self._format_decimal(candidate_price)} < 多头参考价 {self._format_decimal(counterpart_price)}，可能出现不利价差"
                 )
         else:
-            required = counterpart_price / ratio
-            if candidate_price <= required:
+            # 不利价差定义：多头价高于空头价。开多时要求多头价 ≤ 空头参考价。
+            if candidate_price <= counterpart_price:
                 return True, (
-                    f"多头候选价 {self._format_decimal(candidate_price)} ≤ 空头参考价 {self._format_decimal(counterpart_price)}"
-                    f" ÷ (1+{self._format_decimal(self._min_entry_spread, precision=6, pct=True)})"
+                    f"多头候选价 {self._format_decimal(candidate_price)} ≤ 空头参考价 {self._format_decimal(counterpart_price)}，不会产生不利价差"
                 )
             else:
                 return False, (
-                    f"多头候选价 {self._format_decimal(candidate_price)} > 空头参考价 {self._format_decimal(counterpart_price)}"
-                    f" ÷ (1+{self._format_decimal(self._min_entry_spread, precision=6, pct=True)})"
+                    f"多头候选价 {self._format_decimal(candidate_price)} > 空头参考价 {self._format_decimal(counterpart_price)}，可能出现不利价差"
                 )
 
     def _log_spread_evaluation(self, leg: str, stage: str, is_favorable: bool, reason: str):
