@@ -143,9 +143,9 @@ class HyperliquidBinancePerpConfig(StrategyV2ConfigBase):
             raise ValueError(f"Invalid trading pair format '{value}'. Expected BASE-QUOTE.") from exc
         return pair
 
-    @field_validator("order_value_quote", mode="after")
+    @field_validator("order_notional_quote", mode="after")
     @classmethod
-    def validate_order_value(cls, value: Decimal):
+    def validate_order_notional(cls, value: Decimal):
         error = validate_decimal(str(value), 0, None, False)
         if error is not None:
             raise ValueError(error)
