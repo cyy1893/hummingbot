@@ -588,10 +588,17 @@ class HyperliquidBinancePerpArb(StrategyV2Base):
                         continue
                     if last_order_price is None:
                         break
-                    if desired_price != last_order_price:
-                        break
+                    if desired_price == last_order_price:
+                        continue
+                    # 对于买单，如果行情向下移动（desired_price <= last_order_price），说明当前挂单更接近成交；保持不动。
+                    if side == TradeType.BUY and desired_price <= last_order_price:
+                        continue
+                    # 对于卖单，行情向上移动（desired_price >= last_order_price）时保持原单，让其等待成交。
+                    if side == TradeType.SELL and desired_price >= last_order_price:
+                        continue
+                    break
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(RETRY_DELAY_SECONDS)
 
         return False
 
